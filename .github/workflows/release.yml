@@ -1,0 +1,81 @@
+---
+name: Add Kodi addon to repository
+on:
+  workflow_dispatch:
+    inputs:
+      addon_url:
+        description: URL to the Kodi addon to add to the repository
+        required: True
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v2
+      - name: Install tools
+        run: |
+          sudo apt-get install -y curl xmlstarlet unzip
+      - name: Download addon to repository
+        run: |
+          addon_tmp_file="/tmp/addon.zip"
+          curl -L "${{ github.event.inputs.addon_url }}" -o "$addon_tmp_file"
+          ADDON_XML=$(unzip -p "$addon_tmp_file" \*/addon.xml | sed "/<?xml /d")
+          ADDON_ID=$(xmlstarlet sel -t -v "/addon/@id" <<<"$ADDON_XML")
+          ADDON_VERSION=$(xmlstarlet sel -t -v "/addon/@version" <<<"$ADDON_XML")
+
+          [[ "$ADDON_VERSION" =~ \+([a-zA-Z]+)\. ]] && KODI_VERSION=${BASH_REMATCH[1],,} || KODI_VERSION="leia"
+
+          ADDONS_DIR="$KODI_VERSION/addons"
+
+          ADDON_DIR="$ADDONS_DIR/$ADDON_ID"
+          ADDON_FILE="$ADDON_DIR/$ADDON_ID-$ADDON_VERSION.zip"
+          mkdir -p "$ADDON_DIR"
+          mv "$addon_tmp_file" "$ADDON_FILE"
+
+          cat <<EOF >>"$GITHUB_ENV"
+          ADDON_XML<<EOS
+          $ADDON_XML
+          EOS
+          ADDONS_XML_FILE=$KODI_VERSION/addons.xml
+          ADDONS_XML_CHECKSUM_FILE=$KODI_VERSION/addons.xml.sha256
+          ADDONS_DIR=$ADDONS_DIR
+          ADDON_ID=$ADDON_ID
+          ADDON_VERSION=$ADDON_VERSION
+          ADDON_DIR=$ADDON_DIR
+          ADDON_FILE=$ADDON_FILE
+          ADDON_XML_CHECKSUM_FILE=$ADDON_FILE.sha256
+          EOF
+      - name: Compute addon checksum
+        run: |
+          declare -a addon_checksum
+          read -ra addon_checksum < <(sha256sum "$ADDON_FILE")
+          echo "${addon_checksum[0]}" >"$ADDON_XML_CHECKSUM_FILE"
+      - name: Extract assets from addon
+        run: |
+          declare -a addon_assets
+          mapfile -t addon_assets < <(xmlstarlet sel -t -v "/addon/extension/assets/*" <<<"$ADDON_XML")
+          for asset in "${addon_assets[@]}"; do
+              unzip -o "$ADDON_FILE" "$ADDON_ID/$asset" -d "$ADDONS_DIR"
+          done
+      - name: Update addons.xml file
+        run: |
+          [[ -f "$ADDONS_XML_FILE" ]] || echo "<addons/>" >"$ADDONS_XML_FILE"
+          xmlstarlet ed -L -d "/addons/addon[@id='$ADDON_ID' and @version='$ADDON_VERSION']" "$ADDONS_XML_FILE"
+          sed -i "s|<addons/>|<addons></addons>|; s|</addons>|${ADDON_XML//$'\n'/\\n}&|" "$ADDONS_XML_FILE"
+          xmlstarlet fo -e utf-8 "$ADDONS_XML_FILE" >"$ADDONS_XML_FILE.tmp"
+          mv "$ADDONS_XML_FILE.tmp" "$ADDONS_XML_FILE"
+      - name: Compute addons.xml file checksum
+        run: |
+          declare -a addons_xml_checksum
+          read -ra addons_xml_checksum < <(sha256sum "$ADDONS_XML_FILE")
+          echo "${addons_xml_checksum[0]}" >"$ADDONS_XML_CHECKSUM_FILE"
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions"
+          git add "$ADDONS_XML_FILE" "$ADDONS_XML_CHECKSUM_FILE" "$ADDONS_DIR"
+          if ! git diff-index --cached --quiet HEAD --; then
+              git commit -m "Add $ADDON_ID $ADDON_VERSION"
+              git push
+          fi
